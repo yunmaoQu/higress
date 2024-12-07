@@ -33,7 +33,7 @@ import (
 
 	"github.com/alibaba/higress/pkg/ingress/kube/controller"
 	"github.com/alibaba/higress/pkg/ingress/kube/util"
-	. "github.com/alibaba/higress/pkg/ingress/log"
+	"github.com/alibaba/higress/pkg/ingress/log"
 )
 
 type HigressConfigController controller.Controller[listersv1.ConfigMapNamespaceLister]
@@ -67,6 +67,8 @@ type ConfigmapMgr struct {
 	higressConfig           atomic.Value
 	ItemControllers         []ItemController
 	XDSUpdater              model.XDSUpdater
+	notFoundController 		*NotFoundController
+	
 }
 
 func NewConfigmapMgr(XDSUpdater model.XDSUpdater, namespace string, higressConfigController HigressConfigController, higressConfigLister listersv1.ConfigMapNamespaceLister) *ConfigmapMgr {
@@ -88,6 +90,9 @@ func NewConfigmapMgr(XDSUpdater model.XDSUpdater, namespace string, higressConfi
 
 	globalOptionController := NewGlobalOptionController(namespace)
 	configmapMgr.AddItemControllers(globalOptionController)
+	notFoundController := NewNotFoundController(namespace)
+    configmapMgr.notFoundController = notFoundController
+    configmapMgr.AddItemControllers(notFoundController)
 
 	configmapMgr.initEventHandlers()
 
@@ -107,7 +112,25 @@ func (c *ConfigmapMgr) GetHigressConfig() *HigressConfig {
 	}
 	return nil
 }
+func (c *ConfigmapMgr) GetNotFoundContentType() string {
+    config := c.GetHigressConfig()
+    if config != nil && 
+       config.Gateway.NotFoundResponse != nil && 
+       config.Gateway.NotFoundResponse.Enabled {
+        return config.Gateway.NotFoundResponse.ContentType
+    }
+    return ""
+}
 
+func (c *ConfigmapMgr) GetNotFoundBody() string {
+    config := c.GetHigressConfig()
+    if config != nil && 
+       config.Gateway.NotFoundResponse != nil && 
+       config.Gateway.NotFoundResponse.Enabled {
+        return config.Gateway.NotFoundResponse.Body
+    }
+    return ""
+}
 func (c *ConfigmapMgr) AddItemControllers(controllers ...ItemController) {
 	c.ItemControllers = append(c.ItemControllers, controllers...)
 }

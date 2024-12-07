@@ -52,6 +52,18 @@ type WrapperGateway struct {
 	Host          string
 }
 
+type NotFoundResponse struct {
+    ContentType string
+    Body       string
+}
+
+func NewDefaultNotFoundResponse() *NotFoundResponse {
+    return &NotFoundResponse{
+        ContentType: DefaultNotFoundContentType,
+        Body:       DefaultNotFoundBody,
+    }
+}
+
 func CreateMcpServiceKey(host string, portNumber int32) ServiceKey {
 	return ServiceKey{
 		Namespace:   "mcp",

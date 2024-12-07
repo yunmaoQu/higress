@@ -441,6 +441,7 @@ gateway:
     # -- The name of the service account to use.
     # If not set, the release name is used
     name: ""
+  
 
   # -- Pod environment variables
   env: {}
@@ -526,6 +527,20 @@ gateway:
     relabelConfigs: []
     # -- some more raw podMetricsEndpoints spec
     rawSpec: {}
+    notFoundResponse:
+    # -- Whether to enable custom 404 response
+    enabled: true
+    # -- Content type for 404 response
+    contentType: "text/html"
+    # -- HTML body for 404 response
+    body: |
+      <html>
+      <head><title>404 Not Found</title></head>
+      <body>
+      <center><h1>404 Not Found</h1></center>
+      <hr><center>higress</center>
+      </body>
+      </html>
 
 controller:
   name: "higress-controller"

@@ -425,12 +425,19 @@ func (m *IngressConfig) convertGateways(configs []common.WrapperConfig) []config
 }
 
 func (m *IngressConfig) convertVirtualService(configs []common.WrapperConfig) []config.Config {
-	convertOptions := common.ConvertOptions{
-		IngressRouteCache: common.NewIngressRouteCache(),
-		VirtualServices:   map[string]*common.WrapperVirtualService{},
-		HTTPRoutes:        map[string][]*common.WrapperHTTPRoute{},
-		Route2Ingress:     map[string]*common.WrapperConfigWithRuleKey{},
-	}
+	notFoundResponse := &common.NotFoundResponse{
+        ContentType: m.configmapMgr.GetNotFoundContentType(),
+        Body:       m.configmapMgr.GetNotFoundBody(),
+    }
+    
+    if notFoundResponse.ContentType == "" {
+        notFoundResponse.ContentType = common.FallbackNotFoundContentType
+    }
+    if notFoundResponse.Body == "" {
+        notFoundResponse.Body = common.FallbackNotFoundBody
+    }
+    
+	
 
 	// convert http route
 	for idx := range configs {
@@ -465,7 +472,7 @@ func (m *IngressConfig) convertVirtualService(configs []common.WrapperConfig) []
 			normalizeWeightedCluster(convertOptions.IngressRouteCache, route)
 		}
 	}
-
+	
 	// Apply spec default backend.
 	if convertOptions.HasDefaultBackend {
 		for idx := range configs {
@@ -524,6 +531,26 @@ func (m *IngressConfig) convertVirtualService(configs []common.WrapperConfig) []
 		for _, route := range routes {
 			vs.Http = append(vs.Http, route.HTTPRoute)
 		}
+		if !convertOptions.HasDefaultBackend {
+            notFoundRoute := &networking.HTTPRoute{
+                Name: "default-404",
+                Match: []*networking.HTTPMatchRequest{{
+                    Uri: &networking.StringMatch{
+                        MatchType: &networking.StringMatch_Prefix{
+                            Prefix: "/",
+                        },
+                    },
+                }},
+                DirectResponse: &networking.HTTPDirectResponse{
+                    Status: 404,
+                    Body: &networking.HTTPBody{
+                        Content: convertOptions.NotFoundResponse.Body,
+                        ContentType: convertOptions.NotFoundResponse.ContentType,
+                    },
+                },
+            }
+            vs.Http = append(vs.Http, notFoundRoute)
+        }
 
 		firstRoute := routes[0]
 		out = append(out, config.Config{

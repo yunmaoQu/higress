@@ -609,3 +609,150 @@ func TestConstructBasicAuthEnvoyFilter(t *testing.T) {
 	target := proto.Clone(pb).(*httppb.HttpFilter)
 	t.Log(target)
 }
+
+// pkg/ingress/config/ingress_config_test.go
+
+func TestConvertVirtualService_NotFound(t *testing.T) {
+    // 创建测试用的 IngressConfig 实例
+    ic := &IngressConfig{
+        configmapMgr: &mockConfigmapMgr{
+            notFoundContentType: "text/html",
+            notFoundBody: "<html><body>Custom 404</body></html>",
+        },
+    }
+
+    // 测试用例
+    testCases := []struct {
+        name               string
+        configs           []common.WrapperConfig
+        hasDefaultBackend bool
+        expectNotFound    bool
+        expectBody        string
+    }{
+        {
+            name: "should_add_404_route",
+            configs: []common.WrapperConfig{
+                {
+                    Config: &config.Config{
+                        Meta: config.Meta{
+                            Name:      "test-ingress",
+                            Namespace: "default",
+                        },
+                    },
+                    AnnotationsConfig: &annotations.Ingress{
+                        Meta: annotations.Meta{
+                            Namespace: "default",
+                            Name:     "test-ingress",
+                        },
+                    },
+                },
+            },
+            hasDefaultBackend: false,
+            expectNotFound:    true,
+            expectBody:        "<html><body>Custom 404</body></html>",
+        },
+        {
+            name: "should_not_add_404_when_default_backend_exists",
+            configs: []common.WrapperConfig{
+                {
+                    Config: &config.Config{
+                        Meta: config.Meta{
+                            Name:      "test-ingress",
+                            Namespace: "default",
+                        },
+                    },
+                    AnnotationsConfig: &annotations.Ingress{
+                        Meta: annotations.Meta{
+                            Namespace: "default",
+                            Name:     "test-ingress",
+                        },
+                    },
+                },
+            },
+            hasDefaultBackend: true,
+            expectNotFound:    false,
+        },
+    }
+
+    for _, tc := range testCases {
+        t.Run(tc.name, func(t *testing.T) {
+            // 设置测试环境
+            convertOptions := common.ConvertOptions{
+                IngressRouteCache: common.NewIngressRouteCache(),
+                VirtualServices:   map[string]*common.WrapperVirtualService{},
+                HTTPRoutes:        map[string][]*common.WrapperHTTPRoute{},
+                Route2Ingress:     map[string]*common.WrapperConfigWithRuleKey{},
+                HasDefaultBackend: tc.hasDefaultBackend,
+            }
+
+            // 添加测试路由
+            host := "test.example.com"
+            convertOptions.HTTPRoutes[host] = []*common.WrapperHTTPRoute{
+                {
+                    HTTPRoute: &networking.HTTPRoute{
+                        Name: "test-route",
+                        Match: []*networking.HTTPMatchRequest{
+                            {
+                                Uri: &networking.StringMatch{
+                                    MatchType: &networking.StringMatch_Prefix{
+                                        Prefix: "/test",
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    Host: host,
+                },
+            }
+
+            // 添加虚拟服务
+            convertOptions.VirtualServices[host] = &common.WrapperVirtualService{
+                VirtualService: &networking.VirtualService{
+                    Hosts: []string{host},
+                },
+                WrapperConfig: &tc.configs[0],
+            }
+
+            // 执行转换
+            results := ic.convertVirtualService(tc.configs)
+
+            // 验证结果
+            for _, result := range results {
+                vs := result.Spec.(*networking.VirtualService)
+                found404Route := false
+                for _, route := range vs.Http {
+                    if route.Name == "default-404" {
+                        found404Route = true
+                        if tc.expectNotFound {
+                            // 验证404路由配置
+                            if route.DirectResponse == nil {
+                                t.Error("Expected DirectResponse in 404 route")
+                                continue
+                            }
+                            if got := route.DirectResponse.Status; got != 404 {
+                                t.Errorf("Expected status 404, got %d", got)
+                            }
+                            if got := route.DirectResponse.Body.Content; got != tc.expectBody {
+                                t.Errorf("Expected body %q, got %q", tc.expectBody, got)
+                            }
+                            // 验证路由匹配规则
+                            if len(route.Match) != 1 {
+                                t.Error("Expected one match rule")
+                                continue
+                            }
+                            match := route.Match[0]
+                            if match.Uri == nil || match.Uri.GetPrefix() != "/" {
+                                t.Error("Expected catch-all prefix match '/'")
+                            }
+                        }
+                        break
+                    }
+                }
+                if found404Route != tc.expectNotFound {
+                    t.Errorf("Expected 404 route: %v, got: %v", tc.expectNotFound, found404Route)
+                }
+            }
+        })
+    }
+}
+
