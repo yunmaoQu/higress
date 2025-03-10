@@ -1,7 +1,7 @@
 package provider
 
 import (
-	"encoding/json"
+	"bytes"
 	"errors"
 	"math/rand"
 	"net/http"
@@ -12,14 +12,29 @@ import (
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 type ApiName string
 type Pointcut string
 
 const (
-	ApiNameChatCompletion ApiName = "chatCompletion"
-	ApiNameEmbeddings     ApiName = "embeddings"
+
+	// ApiName 格式 {vendor}/{version}/{apitype}
+	// 表示遵循 厂商/版本/接口类型 的格式
+	// 目前openai是事实意义上的标准，但是也有其他厂商存在其他任务的一些可能的标准，比如cohere的rerank
+	ApiNameCompletion      ApiName = "openai/v1/completions"
+	ApiNameChatCompletion  ApiName = "openai/v1/chatcompletions"
+	ApiNameEmbeddings      ApiName = "openai/v1/embeddings"
+	ApiNameImageGeneration ApiName = "openai/v1/imagegeneration"
+	ApiNameAudioSpeech     ApiName = "openai/v1/audiospeech"
+
+	PathOpenAICompletions     = "/v1/completions"
+	PathOpenAIChatCompletions = "/v1/chat/completions"
+	PathOpenAIEmbeddings      = "/v1/embeddings"
+
+	// TODO: 以下是一些非标准的API名称，需要进一步确认是否支持
+	ApiNameCohereV1Rerank ApiName = "cohere/v1/rerank"
 
 	providerTypeMoonshot   = "moonshot"
 	providerTypeAzure      = "azure"
@@ -47,6 +62,7 @@ const (
 	providerTypeDoubao     = "doubao"
 	providerTypeCoze       = "coze"
 	providerTypeTogetherAI = "together-ai"
+	providerTypeDify       = "dify"
 
 	protocolOpenAI   = "openai"
 	protocolOriginal = "original"
@@ -58,17 +74,23 @@ const (
 	finishReasonStop   = "stop"
 	finishReasonLength = "length"
 
-	ctxKeyIncrementalStreaming = "incrementalStreaming"
-	ctxKeyApiKey               = "apiKey"
-	CtxKeyApiName              = "apiName"
-	ctxKeyIsStreaming          = "isStreaming"
-	ctxKeyStreamingBody        = "streamingBody"
-	ctxKeyOriginalRequestModel = "originalRequestModel"
-	ctxKeyFinalRequestModel    = "finalRequestModel"
-	ctxKeyPushedMessage        = "pushedMessage"
+	ctxKeyIncrementalStreaming   = "incrementalStreaming"
+	ctxKeyApiKey                 = "apiKey"
+	CtxKeyApiName                = "apiName"
+	ctxKeyIsStreaming            = "isStreaming"
+	ctxKeyStreamingBody          = "streamingBody"
+	ctxKeyOriginalRequestModel   = "originalRequestModel"
+	ctxKeyFinalRequestModel      = "finalRequestModel"
+	ctxKeyPushedMessage          = "pushedMessage"
+	ctxKeyContentPushed          = "contentPushed"
+	ctxKeyReasoningContentPushed = "reasoningContentPushed"
 
 	objectChatCompletion      = "chat.completion"
 	objectChatCompletionChunk = "chat.completion.chunk"
+
+	reasoningBehaviorPassThrough = "passthrough"
+	reasoningBehaviorIgnore      = "ignore"
+	reasoningBehaviorConcat      = "concat"
 
 	wildcard = "*"
 
@@ -76,7 +98,7 @@ const (
 )
 
 type providerInitializer interface {
-	ValidateConfig(ProviderConfig) error
+	ValidateConfig(*ProviderConfig) error
 	CreateProvider(ProviderConfig) (Provider, error)
 }
 
@@ -110,6 +132,7 @@ var (
 		providerTypeDoubao:     &doubaoProviderInitializer{},
 		providerTypeCoze:       &cozeProviderInitializer{},
 		providerTypeTogetherAI: &togetherAIProviderInitializer{},
+		providerTypeDify:       &difyProviderInitializer{},
 	}
 )
 
@@ -127,6 +150,10 @@ type RequestBodyHandler interface {
 
 type StreamingResponseBodyHandler interface {
 	OnStreamingResponseBody(ctx wrapper.HttpContext, name ApiName, chunk []byte, isLastChunk bool, log wrapper.Log) ([]byte, error)
+}
+
+type StreamingEventHandler interface {
+	OnStreamingEvent(ctx wrapper.HttpContext, name ApiName, event StreamEvent, log wrapper.Log) ([]StreamEvent, error)
 }
 
 type ApiNameHandler interface {
@@ -155,12 +182,6 @@ type TransformResponseBodyHandler interface {
 	TransformResponseBody(ctx wrapper.HttpContext, apiName ApiName, body []byte, log wrapper.Log) ([]byte, error)
 }
 
-// TickFuncHandler allows the provider to execute a function periodically
-// Use case: the maximum expiration time of baidu apiToken is 24 hours, need to refresh periodically
-type TickFuncHandler interface {
-	GetTickFunc(log wrapper.Log) (tickPeriod int64, tickFunc func())
-}
-
 type ProviderConfig struct {
 	// @Title zh-CN ID
 	// @Description zh-CN AI服务提供商标识
@@ -172,7 +193,7 @@ type ProviderConfig struct {
 	// @Description zh-CN 在请求AI服务时用于认证的API Token列表。不同的AI服务提供商可能有不同的名称。部分供应商只支持配置一个API Token（如Azure OpenAI）。
 	apiTokens []string `required:"false" yaml:"apiToken" json:"apiTokens"`
 	// @Title zh-CN 请求超时
-	// @Description zh-CN 请求AI服务的超时时间，单位为毫秒。默认值为120000，即2分钟
+	// @Description zh-CN 请求AI服务的超时时间，单位为毫秒。默认值为120000，即2分钟。此项配置目前仅用于获取上下文信息，并不影响实际转发大模型请求。
 	timeout uint32 `required:"false" yaml:"timeout" json:"timeout"`
 	// @Title zh-CN apiToken 故障切换
 	// @Description zh-CN 当 apiToken 不可用时移出 apiTokens 列表，对移除的 apiToken 进行健康检查，当重新可用后加回 apiTokens 列表
@@ -180,6 +201,9 @@ type ProviderConfig struct {
 	// @Title zh-CN 失败请求重试
 	// @Description zh-CN 对失败的请求立即进行重试
 	retryOnFailure *retryOnFailure `required:"false" yaml:"retryOnFailure" json:"retryOnFailure"`
+	// @Title zh-CN 推理内容处理方式
+	// @Description zh-CN 如何处理大模型服务返回的推理内容。目前支持以下取值：passthrough（正常输出推理内容）、ignore（不输出推理内容）、concat（将推理内容拼接在常规输出内容之前）。默认为 normal。仅支持通义千问服务。
+	reasoningContentMode string `required:"false" yaml:"reasoningContentMode" json:"reasoningContentMode"`
 	// @Title zh-CN 基于OpenAI协议的自定义后端URL
 	// @Description zh-CN 仅适用于支持 openai 协议的服务。
 	openaiCustomUrl string `required:"false" yaml:"openaiCustomUrl" json:"openaiCustomUrl"`
@@ -246,17 +270,17 @@ type ProviderConfig struct {
 	// @Title zh-CN 自定义大模型参数配置
 	// @Description zh-CN 用于填充或者覆盖大模型调用时的参数
 	customSettings []CustomSetting
-	// @Title zh-CN Baidu 的 Access Key 和 Secret Key，中间用 : 分隔，用于申请 apiToken
-	baiduAccessKeyAndSecret []string `required:"false" yaml:"baiduAccessKeyAndSecret" json:"baiduAccessKeyAndSecret"`
-	// @Title zh-CN 请求刷新百度 apiToken 服务名称
-	baiduApiTokenServiceName string `required:"false" yaml:"baiduApiTokenServiceName" json:"baiduApiTokenServiceName"`
-	// @Title zh-CN 请求刷新百度 apiToken 服务域名
-	baiduApiTokenServiceHost string `required:"false" yaml:"baiduApiTokenServiceHost" json:"baiduApiTokenServiceHost"`
-	// @Title zh-CN 请求刷新百度 apiToken 服务端口
-	baiduApiTokenServicePort int64 `required:"false" yaml:"baiduApiTokenServicePort" json:"baiduApiTokenServicePort"`
-	// @Title zh-CN 是否使用全局的 apiToken
-	// @Description zh-CN 如果没有启用 apiToken failover，但是 apiToken 的状态又需要在多个 Wasm VM 中同步时需要将该参数设置为 true，例如 Baidu 的 apiToken 需要定时刷新
-	useGlobalApiToken bool `required:"false" yaml:"useGlobalApiToken" json:"useGlobalApiToken"`
+	// @Title zh-CN dify私有化部署的url
+	difyApiUrl string `required:"false" yaml:"difyApiUrl" json:"difyApiUrl"`
+	// @Title zh-CN dify的应用类型，Chat/Completion/Agent/Workflow
+	botType string `required:"false" yaml:"botType" json:"botType"`
+	// @Title zh-CN dify中应用类型为workflow时需要设置输入变量，当botType为workflow时一起使用
+	inputVariable string `required:"false" yaml:"inputVariable" json:"inputVariable"`
+	// @Title zh-CN dify中应用类型为workflow时需要设置输出变量，当botType为workflow时一起使用
+	outputVariable string `required:"false" yaml:"outputVariable" json:"outputVariable"`
+	// @Title zh-CN 额外支持的ai能力
+	// @Description zh-CN 开放的ai能力和urlpath映射，例如： {"openai/v1/chatcompletions": "/v1/chat/completions"}
+	capabilities map[string]string
 }
 
 func (c *ProviderConfig) GetId() string {
@@ -269,6 +293,10 @@ func (c *ProviderConfig) GetType() string {
 
 func (c *ProviderConfig) GetProtocol() string {
 	return c.protocol
+}
+
+func (c *ProviderConfig) IsOpenAIProtocol() bool {
+	return c.protocol == protocolOpenAI
 }
 
 func (c *ProviderConfig) FromJson(json gjson.Result) {
@@ -349,6 +377,20 @@ func (c *ProviderConfig) FromJson(json gjson.Result) {
 		}
 	}
 
+	c.reasoningContentMode = json.Get("reasoningContentMode").String()
+	if c.reasoningContentMode == "" {
+		c.reasoningContentMode = reasoningBehaviorPassThrough
+	} else {
+		c.reasoningContentMode = strings.ToLower(c.reasoningContentMode)
+		switch c.reasoningContentMode {
+		case reasoningBehaviorPassThrough, reasoningBehaviorIgnore, reasoningBehaviorConcat:
+			break
+		default:
+			c.reasoningContentMode = reasoningBehaviorPassThrough
+			break
+		}
+	}
+
 	failoverJson := json.Get("failover")
 	c.failover = &failover{
 		enabled: false,
@@ -364,25 +406,26 @@ func (c *ProviderConfig) FromJson(json gjson.Result) {
 	if retryOnFailureJson.Exists() {
 		c.retryOnFailure.FromJson(retryOnFailureJson)
 	}
+	c.difyApiUrl = json.Get("difyApiUrl").String()
+	c.botType = json.Get("botType").String()
+	c.inputVariable = json.Get("inputVariable").String()
+	c.outputVariable = json.Get("outputVariable").String()
 
-	for _, accessKeyAndSecret := range json.Get("baiduAccessKeyAndSecret").Array() {
-		c.baiduAccessKeyAndSecret = append(c.baiduAccessKeyAndSecret, accessKeyAndSecret.String())
-	}
-	c.baiduApiTokenServiceName = json.Get("baiduApiTokenServiceName").String()
-	c.baiduApiTokenServiceHost = json.Get("baiduApiTokenServiceHost").String()
-	if c.baiduApiTokenServiceHost == "" {
-		c.baiduApiTokenServiceHost = baiduApiTokenDomain
-	}
-	c.baiduApiTokenServicePort = json.Get("baiduApiTokenServicePort").Int()
-	if c.baiduApiTokenServicePort == 0 {
-		c.baiduApiTokenServicePort = baiduApiTokenPort
+	c.capabilities = make(map[string]string)
+	for capability, pathJson := range json.Get("capabilities").Map() {
+		// 过滤掉不受支持的能力
+		switch capability {
+		case string(ApiNameChatCompletion),
+			string(ApiNameEmbeddings),
+			string(ApiNameImageGeneration),
+			string(ApiNameAudioSpeech),
+			string(ApiNameCohereV1Rerank):
+			c.capabilities[capability] = pathJson.String()
+		}
 	}
 }
 
 func (c *ProviderConfig) Validate() error {
-	if c.timeout < 0 {
-		return errors.New("invalid timeout in config")
-	}
 	if c.protocol != protocolOpenAI && c.protocol != protocolOriginal {
 		return errors.New("invalid protocol in config")
 	}
@@ -405,7 +448,7 @@ func (c *ProviderConfig) Validate() error {
 	if !has {
 		return errors.New("unknown provider type: " + c.typ)
 	}
-	if err := initializer.ValidateConfig(*c); err != nil {
+	if err := initializer.ValidateConfig(c); err != nil {
 		return err
 	}
 	return nil
@@ -515,7 +558,7 @@ func getMappedModel(model string, modelMapping map[string]string, log wrapper.Lo
 }
 
 func doGetMappedModel(model string, modelMapping map[string]string, log wrapper.Log) string {
-	if modelMapping == nil || len(modelMapping) == 0 {
+	if len(modelMapping) == 0 {
 		return ""
 	}
 
@@ -543,11 +586,99 @@ func doGetMappedModel(model string, modelMapping map[string]string, log wrapper.
 	return ""
 }
 
+func ExtractStreamingEvents(ctx wrapper.HttpContext, chunk []byte, log wrapper.Log) []StreamEvent {
+	body := chunk
+	if bufferedStreamingBody, has := ctx.GetContext(ctxKeyStreamingBody).([]byte); has {
+		body = append(bufferedStreamingBody, chunk...)
+	}
+	body = bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+	body = bytes.ReplaceAll(body, []byte("\r"), []byte("\n"))
+
+	eventStartIndex, lineStartIndex, valueStartIndex := -1, -1, -1
+
+	defer func() {
+		if eventStartIndex >= 0 && eventStartIndex < len(body) {
+			// Just in case the received chunk is not a complete event.
+			ctx.SetContext(ctxKeyStreamingBody, body[eventStartIndex:])
+		} else {
+			ctx.SetContext(ctxKeyStreamingBody, nil)
+		}
+	}()
+
+	// Sample Qwen event response:
+	//
+	// event:result
+	// :HTTP_STATUS/200
+	// data:{"output":{"choices":[{"message":{"content":"你好！","role":"assistant"},"finish_reason":"null"}]},"usage":{"total_tokens":116,"input_tokens":114,"output_tokens":2},"request_id":"71689cfc-1f42-9949-86e8-9563b7f832b1"}
+	//
+	// event:error
+	// :HTTP_STATUS/400
+	// data:{"code":"InvalidParameter","message":"Preprocessor error","request_id":"0cbe6006-faec-9854-bf8b-c906d75c3bd8"}
+	//
+
+	var events []StreamEvent
+
+	currentKey := ""
+	currentEvent := &StreamEvent{}
+	i, length := 0, len(body)
+	for i = 0; i < length; i++ {
+		ch := body[i]
+		if ch != '\n' {
+			if lineStartIndex == -1 {
+				if eventStartIndex == -1 {
+					eventStartIndex = i
+				}
+				lineStartIndex = i
+				valueStartIndex = -1
+			}
+			if valueStartIndex == -1 {
+				if ch == ':' {
+					valueStartIndex = i + 1
+					currentKey = string(body[lineStartIndex:valueStartIndex])
+				}
+			} else if valueStartIndex == i && ch == ' ' {
+				// Skip leading spaces in data.
+				valueStartIndex = i + 1
+			}
+			continue
+		}
+
+		if lineStartIndex != -1 {
+			value := string(body[valueStartIndex:i])
+			currentEvent.SetValue(currentKey, value)
+		} else {
+			// Extra new line. The current event is complete.
+			events = append(events, *currentEvent)
+			// Reset event parsing state.
+			eventStartIndex = -1
+			currentEvent = &StreamEvent{}
+		}
+
+		// Reset line parsing state.
+		lineStartIndex = -1
+		valueStartIndex = -1
+		currentKey = ""
+	}
+
+	return events
+}
+
+func (c *ProviderConfig) isSupportedAPI(apiName ApiName) bool {
+	_, exist := c.capabilities[string(apiName)]
+	return exist
+}
+
+func (c *ProviderConfig) setDefaultCapabilities(capabilities map[string]string) {
+	for capability, path := range capabilities {
+		c.capabilities[capability] = path
+	}
+}
+
 func (c *ProviderConfig) handleRequestBody(
 	provider Provider, contextCache *contextCache, ctx wrapper.HttpContext, apiName ApiName, body []byte, log wrapper.Log,
 ) (types.Action, error) {
 	// use original protocol
-	if c.protocol == protocolOriginal {
+	if c.IsOriginal() {
 		return types.ActionContinue, nil
 	}
 
@@ -594,17 +725,21 @@ func (c *ProviderConfig) handleRequestHeaders(provider Provider, ctx wrapper.Htt
 	}
 }
 
+// defaultTransformRequestBody 默认的请求体转换方法，只做模型映射，用slog替换模型名称，不用序列化和反序列化，提高性能
 func (c *ProviderConfig) defaultTransformRequestBody(ctx wrapper.HttpContext, apiName ApiName, body []byte, log wrapper.Log) ([]byte, error) {
-	var request interface{}
-	if apiName == ApiNameChatCompletion {
-		request = &chatCompletionRequest{}
-	} else {
-		request = &embeddingsRequest{}
+	switch apiName {
+	case ApiNameChatCompletion:
+		stream := gjson.GetBytes(body, "stream").Bool()
+		if stream {
+			_ = proxywasm.ReplaceHttpRequestHeader("Accept", "text/event-stream")
+			ctx.SetContext(ctxKeyIsStreaming, true)
+		} else {
+			ctx.SetContext(ctxKeyIsStreaming, false)
+		}
 	}
-	if err := c.parseRequestAndMapModel(ctx, request, body, log); err != nil {
-		return nil, err
-	}
-	return json.Marshal(request)
+	model := gjson.GetBytes(body, "model").String()
+	ctx.SetContext(ctxKeyOriginalRequestModel, model)
+	return sjson.SetBytes(body, "model", getMappedModel(model, c.modelMapping, log))
 }
 
 func (c *ProviderConfig) DefaultTransformResponseHeaders(ctx wrapper.HttpContext, headers http.Header) {

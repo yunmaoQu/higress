@@ -30,7 +30,7 @@ LLM 结果缓存插件，默认配置方式可以直接用于 openai 协议的�
 
 ## 配置说明
 
-本插件同时支持基于向量数据库的语义化缓存和基于字符串匹配的缓存方法，如果同时配置了向量数据库和缓存数据库，优先使用向量数据库。
+本插件同时支持基于向量数据库的语义化缓存和基于字符串匹配的缓存方法，如果同时配置了向量数据库和缓存数据库，优先使用缓存数据库，未命中场景下使用向量数据库能力。
 
 *Note*: 向量数据库(vector) 和 缓存数据库(cache) 不能同时为空，否则本插件无法提供缓存服务。
 
@@ -86,7 +86,8 @@ LLM 结果缓存插件，默认配置方式可以直接用于 openai 协议的�
 | cache.password | string | optional | "" | 缓存服务密码 |
 | cache.timeout | uint32 | optional | 10000 | 缓存服务的超时时间，单位为毫秒。默认值是10000，即10秒 |
 | cache.cacheTTL | int | optional | 0 | 缓存过期时间，单位为秒。默认值是 0，即 永不过期|
-| cacheKeyPrefix | string | optional | "higress-ai-cache:" | 缓存 Key 的前缀，默认值为 "higress-ai-cache:" |
+| cache.cacheKeyPrefix | string | optional | "higress-ai-cache:" | 缓存 Key 的前缀，默认值为 "higress-ai-cache:" |
+| cache.database | int | optional | 0 | 使用的数据库id，仅限redis，例如配置为1，对应`SELECT 1` |
 
 
 ## 其他配置
@@ -168,6 +169,7 @@ redis:
   serviceName: my_redis.dns
   servicePort: 6379
   timeout: 100
+  database: 1
 ```
 
 ## 进阶用法

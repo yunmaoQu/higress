@@ -14,14 +14,19 @@ const (
 
 type cozeProviderInitializer struct{}
 
-func (m *cozeProviderInitializer) ValidateConfig(config ProviderConfig) error {
+func (m *cozeProviderInitializer) ValidateConfig(config *ProviderConfig) error {
 	if config.apiTokens == nil || len(config.apiTokens) == 0 {
 		return errors.New("no apiToken found in provider config")
 	}
 	return nil
 }
 
+func (m *cozeProviderInitializer) DefaultCapabilities() map[string]string {
+	return map[string]string{}
+}
+
 func (m *cozeProviderInitializer) CreateProvider(config ProviderConfig) (Provider, error) {
+	config.setDefaultCapabilities(m.DefaultCapabilities())
 	return &cozeProvider{
 		config:       config,
 		contextCache: createContextCache(&config),

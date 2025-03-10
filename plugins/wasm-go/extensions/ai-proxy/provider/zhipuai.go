@@ -13,18 +13,27 @@ import (
 const (
 	zhipuAiDomain             = "open.bigmodel.cn"
 	zhipuAiChatCompletionPath = "/api/paas/v4/chat/completions"
+	zhipuAiEmbeddingsPath     = "/api/paas/v4/embeddings"
 )
 
 type zhipuAiProviderInitializer struct{}
 
-func (m *zhipuAiProviderInitializer) ValidateConfig(config ProviderConfig) error {
+func (m *zhipuAiProviderInitializer) ValidateConfig(config *ProviderConfig) error {
 	if config.apiTokens == nil || len(config.apiTokens) == 0 {
 		return errors.New("no apiToken found in provider config")
 	}
 	return nil
 }
 
+func (m *zhipuAiProviderInitializer) DefaultCapabilities() map[string]string {
+	return map[string]string{
+		string(ApiNameChatCompletion): zhipuAiChatCompletionPath,
+		string(ApiNameEmbeddings):     zhipuAiEmbeddingsPath,
+	}
+}
+
 func (m *zhipuAiProviderInitializer) CreateProvider(config ProviderConfig) (Provider, error) {
+	config.setDefaultCapabilities(m.DefaultCapabilities())
 	return &zhipuAiProvider{
 		config:       config,
 		contextCache: createContextCache(&config),
@@ -41,22 +50,19 @@ func (m *zhipuAiProvider) GetProviderType() string {
 }
 
 func (m *zhipuAiProvider) OnRequestHeaders(ctx wrapper.HttpContext, apiName ApiName, log wrapper.Log) error {
-	if apiName != ApiNameChatCompletion {
-		return errUnsupportedApiName
-	}
 	m.config.handleRequestHeaders(m, ctx, apiName, log)
 	return nil
 }
 
 func (m *zhipuAiProvider) OnRequestBody(ctx wrapper.HttpContext, apiName ApiName, body []byte, log wrapper.Log) (types.Action, error) {
-	if apiName != ApiNameChatCompletion {
+	if !m.config.isSupportedAPI(apiName) {
 		return types.ActionContinue, errUnsupportedApiName
 	}
 	return m.config.handleRequestBody(m, m.contextCache, ctx, apiName, body, log)
 }
 
 func (m *zhipuAiProvider) TransformRequestHeaders(ctx wrapper.HttpContext, apiName ApiName, headers http.Header, log wrapper.Log) {
-	util.OverwriteRequestPathHeader(headers, zhipuAiChatCompletionPath)
+	util.OverwriteRequestPathHeaderByCapability(headers, string(apiName), m.config.capabilities)
 	util.OverwriteRequestHostHeader(headers, zhipuAiDomain)
 	util.OverwriteRequestAuthorizationHeader(headers, "Bearer "+m.config.GetApiTokenInUse(ctx))
 	headers.Del("Content-Length")
@@ -65,6 +71,9 @@ func (m *zhipuAiProvider) TransformRequestHeaders(ctx wrapper.HttpContext, apiNa
 func (m *zhipuAiProvider) GetApiName(path string) ApiName {
 	if strings.Contains(path, zhipuAiChatCompletionPath) {
 		return ApiNameChatCompletion
+	}
+	if strings.Contains(path, zhipuAiEmbeddingsPath) {
+		return ApiNameEmbeddings
 	}
 	return ""
 }
